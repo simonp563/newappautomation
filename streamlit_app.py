@@ -1,4 +1,4 @@
-# streamlit_app_full_with_replies_and_reminders.py
+# streamlit_app_final.py
 import io
 import re
 import time
@@ -18,8 +18,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# ---------------- Page config ----------------
-st.set_page_config(page_title="Email Automation Tool with Reminders & Auto-Reply Detection")
+st.set_page_config(page_title="Email Automation Tool")
 
 # --- SMTP Settings (Gmail by default) ---
 SMTP_SERVER = "smtp.gmail.com"
@@ -35,8 +34,8 @@ def clean_value(val):
     """Clean individual cell values (remove invisible characters)."""
     if isinstance(val, str):
         return (
-            val.replace("\xa0", " ")
-               .replace("\u200b", "")
+            val.replace("\xa0", " ")      # non-breaking space
+               .replace("\u200b", "")     # zero-width space
                .strip()
         )
     return val
@@ -72,24 +71,11 @@ def strip_non_ascii(s: str) -> str:
         return s
     return ''.join(ch if ord(ch) < 128 else ' ' for ch in s)
 
-def imap_date_from_timestamp(ts):
-    """Return an IMAP-compatible SINCE date string from UNIX timestamp."""
-    dt = datetime.utcfromtimestamp(ts)
-    return dt.strftime("%d-%b-%Y")  # e.g., 01-Jan-2023
-
-def parse_email_address(header_val):
-    """Return email address from header like 'Name <addr@domain>'"""
-    try:
-        _, addr = parseaddr(header_val)
-        return addr.lower()
-    except Exception:
-        return header_val.lower() if isinstance(header_val, str) else ""
-
-# ---------------- Session-state defaults ----------------
+# ---------------- Session-state defaults for counter / logs ----------------
 if "sent_count" not in st.session_state:
     st.session_state.sent_count = 0
 if "sent_log" not in st.session_state:
-    # Each entry: uid, email, name, subject, sent_at, msg_id, replied (bool), bounced (bool)
+    # each entry: uid, email, name, subject, sent_at, msg_id, replied (bool), bounced (bool)
     st.session_state.sent_log = []
 if "failed_rows" not in st.session_state:
     st.session_state.failed_rows = []
@@ -97,7 +83,7 @@ if "wait_time" not in st.session_state:
     st.session_state.wait_time = 20
 
 # --- Top controls: live counter + wait time (placed above upload) ---
-st.title("Email Automation Tool with Reminders & Auto-Reply Detection")
+st.title("Email Automation Tool")
 
 col_top1, col_top2 = st.columns([1, 1])
 with col_top1:
@@ -118,7 +104,7 @@ st.session_state.wait_time = wait_time
 st.subheader("Upload recipient list")
 uploaded_file = st.file_uploader("Upload CSV file", type=["csv"], key="csv_uploader")
 
-# Sample CSV for user convenience
+# Sample CSV
 sample_df = pd.DataFrame({
     "email": ["john.doe@example.com", "jane.smith@example.com"],
     "name": ["John Doe", "Jane Smith"],
@@ -164,22 +150,39 @@ cost = st.number_input(f"Cost in {currency}", min_value=0.0, step=50.0, value=10
 
 # ---------------- Compose Message ----------------
 st.subheader("Compose message")
-subject_tpl = st.text_input(
-    "Enter subject line template",
-    placeholder="Paste your Subject Line (Include any placeholders if required.)",
-    value="",
-    help="Use placeholders like {name}, {company}, {sender}, {cost}, {currency}",
-    key="subject_input"
-)
+subject_options = [
+    "Special proposal for {company}",
+    "Collaboration opportunity with {company}",
+    "Exclusive offer for {name}",
+    "Your personalized proposal from {sender}"
+]
+subject_tpl = st.selectbox("Choose a subject line", subject_options, key="subject_select")
 
-body_tpl = st.text_area(
-    "Enter body template",
-    placeholder=("Paste Your Email Body (Include any placeholders if required.)"),
-    value="",
-    height=300,
-    help="Use placeholders like {name}, {company}, {sender}, {cost}, {currency}",
-    key="body_input"
-)
+body_templates = {
+    "Proposal (standard)": (
+        "Hi {name},\n\n"
+        "I’m reaching out with a tailored proposal for {company}. "
+        "Our solution is designed to add real value, and we can offer this at "
+        "{cost} {currency}.\n\n"
+        "Let me know if this works for you, and I’d be happy to discuss further.\n\n"
+        "Best regards,\n{sender}"
+    ),
+    "Follow-up (gentle reminder)": (
+        "Hi {name},\n\n"
+        "I just wanted to follow up on my earlier message about {company}. "
+        "This opportunity is still available for {cost} {currency}, "
+        "and I’d love to hear your thoughts.\n\n"
+        "Best regards,\n{sender}"
+    ),
+    "Short intro (very concise)": (
+        "Hi {name},\n\n"
+        "Quick note to share a proposal for {company}: {cost} {currency}. "
+        "Would you like to discuss?\n\n"
+        "Cheers,\n{sender}"
+    )
+}
+body_choice = st.selectbox("Choose a body template", list(body_templates.keys()), key="body_template_select")
+body_tpl = st.text_area("Body", value=body_templates[body_choice], height=250, key="body_text")
 
 # ---------------- Send & Reset Buttons ----------------
 col1, col2 = st.columns(2)
@@ -190,14 +193,118 @@ with col2:
 
 # Handle reset
 if reset_clicked:
-    for key in ["sent_count", "sent_log", "failed_rows"]:
-        if key in st.session_state:
-            del st.session_state[key]
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
     st.experimental_rerun()
 
-# ---------------- Sending flow ----------------
+# ---------------- IMAP helper functions for auto-reply/bounce detection ----------------
+def imap_date_from_timestamp(ts):
+    dt = datetime.utcfromtimestamp(ts)
+    return dt.strftime("%d-%b-%Y")
+
+def parse_email_address(header_val):
+    try:
+        _, addr = parseaddr(header_val)
+        return addr.lower()
+    except Exception:
+        return header_val.lower() if isinstance(header_val, str) else ""
+
+def run_imap_detection(imap_server, imap_port, username, password, sent_entries):
+    """
+    Connect to IMAP and mark sent_entries (list of dicts) with replied/bounced flags where detected.
+    Returns updated list and set of detected bounce emails.
+    """
+    updated = [dict(e) for e in sent_entries]  # shallow copy of dicts
+    detected_bounces = set()
+    try:
+        context = ssl.create_default_context()
+        with imaplib.IMAP4_SSL(imap_server, int(imap_port), ssl_context=context) as M:
+            M.login(username, password)
+            M.select("INBOX")
+            if not updated:
+                return updated, detected_bounces
+
+            earliest_ts = min((e.get("sent_at", int(time.time())) for e in updated), default=int(time.time()) - 7*24*3600)
+            since_date = imap_date_from_timestamp(max(earliest_ts - 86400, 0))
+            typ, data = M.search(None, f'(SINCE "{since_date}")')
+            if typ != "OK":
+                return updated, detected_bounces
+            msg_nums = data[0].split()
+
+            bounce_subject_re = re.compile(r"(?i)(undeliver|delivery failure|returned to sender|failure notice|delivery status notification|undelivered|bounce)")
+            mailer_daemon_re = re.compile(r"mailer-daemon|postmaster|no-reply", re.I)
+
+            for num in msg_nums:
+                typ, msg_data = M.fetch(num, '(RFC822)')
+                if typ != "OK":
+                    continue
+                raw = msg_data[0][1]
+                try:
+                    parsed = email.message_from_bytes(raw, policy=policy.default)
+                except Exception:
+                    continue
+
+                from_hdr = parsed.get("From", "")
+                subject_hdr = parsed.get("Subject", "")
+                in_reply_to = parsed.get("In-Reply-To", "") or ""
+                references = parsed.get("References", "") or ""
+                from_addr = parse_email_address(from_hdr)
+
+                # Bounce heuristics
+                if mailer_daemon_re.search(from_hdr) or bounce_subject_re.search(str(subject_hdr)):
+                    body = ""
+                    try:
+                        if parsed.is_multipart():
+                            for part in parsed.walk():
+                                if part.get_content_type() == "text/plain":
+                                    body += part.get_content()
+                        else:
+                            body = parsed.get_content()
+                    except Exception:
+                        body = ""
+                    found_emails = re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", body)
+                    for fe in found_emails:
+                        fe_l = fe.lower()
+                        for entry in updated:
+                            if entry.get("email","").lower() == fe_l:
+                                entry["bounced"] = True
+                                detected_bounces.add(fe_l)
+                    continue
+
+                # Try to match replies by In-Reply-To / References or by from_address + subject similarity
+                body_text = ""
+                try:
+                    if parsed.is_multipart():
+                        for part in parsed.walk():
+                            if part.get_content_type() == "text/plain":
+                                body_text += part.get_content()
+                    else:
+                        body_text = parsed.get_content()
+                except Exception:
+                    body_text = ""
+
+                subj_text = str(subject_hdr or "").lower()
+                for entry in updated:
+                    entry_msgid = (entry.get("msg_id") or "").strip()
+                    entry_subject = (entry.get("subject") or "").lower()
+                    if entry_msgid and entry_msgid in in_reply_to:
+                        entry["replied"] = True
+                    elif entry_msgid and entry_msgid in references:
+                        entry["replied"] = True
+                    elif from_addr and from_addr == entry.get("email","").lower():
+                        # simple subject overlap heuristic
+                        if entry_subject and any(word for word in entry_subject.split() if word and word in subj_text):
+                            entry["replied"] = True
+                        elif entry_msgid and entry_msgid.strip("<>") in body_text:
+                            entry["replied"] = True
+            M.logout()
+    except Exception:
+        # Let caller handle messaging; return what we have
+        pass
+    return updated, list(detected_bounces)
+
+# ---------------- Send flow ----------------
 if send_clicked:
-    # basic validation
     if not from_email or not app_password:
         st.error("Please provide your email and app password.")
         st.stop()
@@ -205,16 +312,11 @@ if send_clicked:
         st.error("Please upload a CSV file with recipients.")
         st.stop()
 
-    # prepare
     progress = st.progress(0)
     total = len(df)
     sent = 0
     skipped_rows = []
     failed_rows = []
-
-    # Ensure sent_log exists
-    if "sent_log" not in st.session_state:
-        st.session_state.sent_log = []
 
     # iterate
     for idx, row in df.iterrows():
@@ -252,13 +354,13 @@ if send_clicked:
         # Ensure replies land in monitored mailbox
         msg["Reply-To"] = from_email
 
-        # Request read receipts (best-effort; often ignored)
+        # Request read receipts (best-effort; often ignored by many clients)
         msg["Disposition-Notification-To"] = from_email
         msg["Return-Receipt-To"] = from_email
         msg["X-Confirm-Reading-To"] = from_email
 
-        # Create and add message-id so we can correlate replies
-        msg_id = make_msgid(domain=None)  # library-generated unique id
+        # Create and add Message-ID so we can correlate replies
+        msg_id = make_msgid()
         msg["Message-ID"] = msg_id
 
         # Attach plain text (or swap to HTML if desired)
@@ -276,9 +378,10 @@ if send_clicked:
                     server.login(from_email, app_password)
                     server.send_message(msg)
 
-            # --- Success actions ---
+            # --- Success: increment counters, update metric, and log the send ---
             sent += 1
             st.session_state.sent_count += 1
+
             try:
                 sent_count_placeholder.metric("Emails sent", st.session_state.sent_count)
             except Exception:
@@ -286,20 +389,19 @@ if send_clicked:
 
             st.success(f"✅ Sent to {recip_addr}")
 
-            # log the sent message (for reminders & reply detection)
+            # Log the send so we can later send reminders / detect replies
             st.session_state.sent_log.append({
                 "uid": uuid.uuid4().hex,
                 "email": recip_addr.lower(),
                 "name": rowd.get("name", ""),
                 "subject": subj_text,
                 "sent_at": int(time.time()),
-                "msg_id": msg_id,   # include angle brackets since make_msgid returns that
+                "msg_id": msg_id,
                 "replied": False,
                 "bounced": False
             })
 
         except Exception as e:
-            # record failure so it won't be included in sent_log
             st.error(f"❌ Failed to send to {recip_addr}: {e}")
             failed_rows.append({**rowd, "__reason": str(e)})
             st.session_state.failed_rows.append({**rowd, "__reason": str(e)})
@@ -352,7 +454,6 @@ if not use_current_log:
     if uploaded_sent_log:
         try:
             sent_log_df = pd.read_csv(uploaded_sent_log)
-            # Normalize columns if needed
             if "email" in sent_log_df.columns:
                 sent_log_df["email"] = sent_log_df["email"].astype(str).str.lower()
         except Exception as e:
@@ -374,165 +475,27 @@ rem_body_tpl = st.text_area("Reminder body template", value="Hi {name},\n\nJust 
 only_non_replied = st.checkbox("Only send reminders to recipients not marked as replied", value=True)
 exclude_bounced = st.checkbox("Exclude recipients known to have bounced", value=True)
 
-# Button to run IMAP-based auto-reply detection and bounce detection
+# Run IMAP-based auto-reply detection and bounce detection
 with st.expander("Auto-Reply & Bounce Detection (IMAP)"):
     st.write("This will connect to your IMAP mailbox and attempt to identify replies and bounces related to messages in the sent log.")
     run_imap = st.button("Run Auto-Reply & Bounce Detection (IMAP)", key="run_imap")
-
-def run_imap_detection(imap_server, imap_port, username, password, sent_log_entries):
-    """
-    Connects to IMAP and attempts to mark entries in sent_log_entries as replied or bounced.
-    Returns updated sent_log_entries (list of dicts) and a list of detected bounces.
-    """
-    updated_log = sent_log_entries.copy()
-    detected_bounces = set()
-    try:
-        st.info("Connecting to IMAP...")
-        context = ssl.create_default_context()
-        with imaplib.IMAP4_SSL(imap_server, int(imap_port), ssl_context=context) as M:
-            M.login(username, password)
-            M.select("INBOX")
-            if not updated_log:
-                st.warning("No sent_log entries to check.")
-                return updated_log, list(detected_bounces)
-
-            # Map emails to their sent entries for quick lookup
-            email_map = {}
-            earliest_ts = min([e["sent_at"] for e in updated_log if e.get("sent_at")], default=int(time.time()) - 7*24*3600)
-            for e in updated_log:
-                email_map.setdefault(e["email"].lower(), []).append(e)
-
-            # Fetch all messages since earliest sent date to reduce search space
-            since_date = imap_date_from_timestamp(max(earliest_ts - 86400, 0))
-            st.info(f"Searching mailbox since {since_date} ...")
-            typ, data = M.search(None, f'(SINCE "{since_date}")')
-            if typ != "OK":
-                st.warning("IMAP search failed or returned no messages.")
-                return updated_log, list(detected_bounces)
-
-            msg_nums = data[0].split()
-            st.info(f"Scanning {len(msg_nums)} messages from mailbox for replies / bounces (may take a while).")
-
-            # Precompile patterns for bounce detection
-            bounce_subject_re = re.compile(r"(?i)(undeliver|delivery failure|returned to sender|failure notice|delivery status notification|undelivered|bounce)")
-            mailer_daemon_re = re.compile(r"mailer-daemon|postmaster|no-reply", re.I)
-
-            for i, num in enumerate(msg_nums):
-                if (i % 100) == 0:
-                    st.progress(i / max(len(msg_nums), 1))
-                typ, msg_data = M.fetch(num, '(RFC822.HEADER RFC822.TEXT)')
-                if typ != "OK":
-                    continue
-                raw = msg_data[0][1]
-                try:
-                    parsed = email.message_from_bytes(raw, policy=policy.default)
-                except Exception:
-                    continue
-
-                # Headers
-                from_hdr = parsed.get("From", "")
-                subject_hdr = parsed.get("Subject", "")
-                in_reply_to = parsed.get("In-Reply-To", "")
-                references = parsed.get("References", "")
-
-                from_addr = parse_email_address(from_hdr)
-
-                # Check bounce heuristics: from mailer-daemon/postmaster or bounce-like subject
-                if mailer_daemon_re.search(from_hdr) or bounce_subject_re.search(str(subject_hdr)):
-                    # try to find email addresses in body that match sent recipients
-                    # fetch full body if not already
-                    body = ""
-                    try:
-                        if parsed.is_multipart():
-                            for part in parsed.walk():
-                                if part.get_content_type() == "text/plain":
-                                    body += part.get_content()
-                        else:
-                            body = parsed.get_content()
-                    except Exception:
-                        body = ""
-
-                    found_emails = re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", body)
-                    found_emails = [e.lower() for e in found_emails]
-                    for fe in found_emails:
-                        # mark as bounced if exists in log
-                        for entry in updated_log:
-                            if entry["email"].lower() == fe:
-                                entry["bounced"] = True
-                                detected_bounces.add(fe)
-                    # continue scanning
-                    continue
-
-                # Check if this message appears to be a reply to any entry
-                # Strategy: match In-Reply-To to msg_id OR match from address + subject contains original subject
-                candidate_msg_id = in_reply_to.strip() if in_reply_to else ""
-                candidate_refs = references.strip() if references else ""
-                # Also fetch body and plain text subject normalized
-                subj_text = str(subject_hdr or "").lower()
-
-                # full body text
-                body = ""
-                try:
-                    if parsed.is_multipart():
-                        for part in parsed.walk():
-                            ct = part.get_content_type()
-                            if ct == "text/plain":
-                                body += part.get_content()
-                    else:
-                        body = parsed.get_content()
-                except Exception:
-                    body = ""
-
-                # Attempt to match to any sent entry
-                for entry in updated_log:
-                    entry_email = entry["email"].lower()
-                    entry_msgid = (entry.get("msg_id") or "").strip()
-                    entry_subject = (entry.get("subject") or "").lower()
-
-                    # Match by In-Reply-To / References header:
-                    if entry_msgid and entry_msgid in (candidate_msg_id or ""):
-                        entry["replied"] = True
-                    elif entry_msgid and entry_msgid in (candidate_refs or ""):
-                        entry["replied"] = True
-                    # Match by from address and subject similarity
-                    elif from_addr and from_addr == entry_email:
-                        # subject match heuristic: whether the sent subject words are in reply subject
-                        # Lowercase and check overlap
-                        if entry_subject and any(word for word in entry_subject.split() if word and word in subj_text):
-                            entry["replied"] = True
-                        else:
-                            # also check body contains some unique tokens (email address or msgid)
-                            if entry_msgid and entry_msgid.strip("<>") in body:
-                                entry["replied"] = True
-
-            st.progress(1.0)
-            M.logout()
-    except imaplib.IMAP4.error as imap_err:
-        st.error(f"IMAP error: {imap_err}")
-    except Exception as exc:
-        st.error(f"Error during IMAP detection: {exc}")
-
-    return updated_log, list(detected_bounces)
 
 if run_imap:
     if not from_email or not app_password:
         st.error("Please provide your email and app password for IMAP.")
     else:
-        # Prepare local sent_log list
         current_sent_log = sent_log_df.to_dict("records") if isinstance(sent_log_df, pd.DataFrame) else []
         updated_log, detected_bounces = run_imap_detection(imap_server, imap_port, from_email, app_password, current_sent_log)
 
         # Update session state with updated replies/bounces
-        # If using session log, update that directly; otherwise prepare updated_df for download
         if use_current_log:
-            # Map by uid or email to update session log
+            # Map by uid to update session log
             for upd in updated_log:
                 for i, e in enumerate(st.session_state.sent_log):
                     if e.get("uid") == upd.get("uid"):
                         st.session_state.sent_log[i].update(upd)
             st.success("Auto-reply/bounce detection complete — session sent_log updated.")
         else:
-            # Provide updated CSV for download
             updated_df = pd.DataFrame(updated_log)
             buf_upd = io.StringIO()
             updated_df.to_csv(buf_upd, index=False)
@@ -594,10 +557,8 @@ if st.button("Send Reminders"):
 
     # Exclude bounced if requested or based on session failed rows
     if exclude_bounced:
-        # Remove entries marked bounced in sent_log
         if "bounced" in remind_df.columns:
             remind_df = remind_df[~remind_df["bounced"].astype(bool)]
-        # Also exclude emails that failed to send earlier in session
         failed_emails = {clean_email_address(r.get("email","")).lower() for r in st.session_state.failed_rows if r.get("email")}
         remind_df = remind_df[~remind_df["email"].isin(failed_emails)]
 
@@ -630,7 +591,6 @@ if st.button("Send Reminders"):
         msg["To"] = to_header
         msg["Subject"] = str(Header(subj, "utf-8"))
         msg["Reply-To"] = from_email
-        # optional read receipts
         msg["Disposition-Notification-To"] = from_email
 
         # Add a new Message-ID for the reminder
@@ -659,7 +619,6 @@ if st.button("Send Reminders"):
             st.success(f"✅ Reminder sent to {recip}")
 
             # Update session sent_log entry (mark last_reminder_at optionally)
-            # find by email and mark last_reminder_sent timestamp
             for e in st.session_state.sent_log:
                 if e.get("email", "").lower() == recip.lower():
                     e["last_reminder_sent_at"] = int(time.time())
